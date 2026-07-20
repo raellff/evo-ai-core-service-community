@@ -11,6 +11,7 @@ import (
 
 type Agent struct {
 	ID               uuid.UUID  `json:"-" gorm:"<-:create;type:uuid;primary_key;default:uuid_generate_v4()"`
+	AccountID        *uuid.UUID `json:"-" gorm:"type:uuid;index"` // Tenant scope - stamped from the authenticated request, never client-supplied
 	Name             string     `json:"name" gorm:"not null; type:varchar(255)"`
 	Description      string     `json:"description" gorm:"type:text"`
 	Type             string     `json:"type" gorm:"not null; type:varchar(10)"`

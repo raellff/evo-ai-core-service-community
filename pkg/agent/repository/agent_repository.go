@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"evo-ai-core-service/internal/utils/contextutils"
 	"evo-ai-core-service/pkg/agent/model"
 	"time"
 
@@ -30,6 +31,15 @@ func NewAgentRepository(db *gorm.DB) AgentRepository {
 }
 
 func (r *agentRepository) Create(ctx context.Context, agent model.Agent) (*model.Agent, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Always stamp from the authenticated request - never trust a
+	// caller-supplied AccountID (AgentRequest/AgentUpdateRequest don't even
+	// expose the field, but this keeps Create() safe regardless of caller).
+	agent.AccountID = &accountID
+
 	if err := r.db.WithContext(ctx).Create(&agent).Error; err != nil {
 		return nil, err
 	}
@@ -38,9 +48,14 @@ func (r *agentRepository) Create(ctx context.Context, agent model.Agent) (*model
 }
 
 func (r *agentRepository) GetByID(ctx context.Context, id uuid.UUID) (*model.Agent, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var agent model.Agent
 
-	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&agent).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("id = ? AND account_id = ?", id, accountID).First(&agent).Error; err != nil {
 		return nil, err
 	}
 
@@ -48,9 +63,14 @@ func (r *agentRepository) GetByID(ctx context.Context, id uuid.UUID) (*model.Age
 }
 
 func (r *agentRepository) List(ctx context.Context, page int, pageSize int) ([]*model.Agent, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return []*model.Agent{}, err
+	}
+
 	var agents []*model.Agent
 
-	if err := r.db.WithContext(ctx).Offset((page - 1) * pageSize).Limit(pageSize).Find(&agents).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("account_id = ?", accountID).Offset((page - 1) * pageSize).Limit(pageSize).Find(&agents).Error; err != nil {
 		return []*model.Agent{}, err
 	}
 
@@ -58,8 +78,13 @@ func (r *agentRepository) List(ctx context.Context, page int, pageSize int) ([]*
 }
 
 func (r *agentRepository) Update(ctx context.Context, agent *model.Agent, id uuid.UUID) (*model.Agent, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	agent.UpdatedAt = time.Now()
-	if err := r.db.WithContext(ctx).Where("id = ?", id).Updates(agent).First(&agent).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("id = ? AND account_id = ?", id, accountID).Updates(agent).First(&agent).Error; err != nil {
 		return nil, err
 	}
 
@@ -67,7 +92,12 @@ func (r *agentRepository) Update(ctx context.Context, agent *model.Agent, id uui
 }
 
 func (r *agentRepository) Delete(ctx context.Context, id uuid.UUID) (bool, error) {
-	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Where("id = ?", id).Delete(&model.Agent{}).Error; err != nil {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Where("id = ? AND account_id = ?", id, accountID).Delete(&model.Agent{}).Error; err != nil {
 		return false, err
 	}
 
@@ -75,8 +105,13 @@ func (r *agentRepository) Delete(ctx context.Context, id uuid.UUID) (bool, error
 }
 
 func (r *agentRepository) Count(ctx context.Context) (int64, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return 0, err
+	}
+
 	var count int64
-	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Count(&count).Error; err != nil {
+	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Where("account_id = ?", accountID).Count(&count).Error; err != nil {
 		return 0, err
 	}
 
@@ -84,8 +119,13 @@ func (r *agentRepository) Count(ctx context.Context) (int64, error) {
 }
 
 func (r *agentRepository) CountByFolderID(ctx context.Context, folderId uuid.UUID) (int64, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return 0, err
+	}
+
 	var count int64
-	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Where("folder_id = ?", folderId).Count(&count).Error; err != nil {
+	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Where("folder_id = ? AND account_id = ?", folderId, accountID).Count(&count).Error; err != nil {
 		return 0, err
 	}
 
@@ -93,8 +133,13 @@ func (r *agentRepository) CountByFolderID(ctx context.Context, folderId uuid.UUI
 }
 
 func (r *agentRepository) RemoveFolder(ctx context.Context, id uuid.UUID) (*model.Agent, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var agent model.Agent
-	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Where("id = ?", id).Update("folder_id", nil).First(&agent).Error; err != nil {
+	if err := r.db.WithContext(ctx).Model(&model.Agent{}).Where("id = ? AND account_id = ?", id, accountID).Update("folder_id", nil).First(&agent).Error; err != nil {
 		return nil, err
 	}
 
@@ -102,9 +147,14 @@ func (r *agentRepository) RemoveFolder(ctx context.Context, id uuid.UUID) (*mode
 }
 
 func (r *agentRepository) ListAgentsByFolderID(ctx context.Context, folderId uuid.UUID, page int, pageSize int) ([]*model.Agent, error) {
+	accountID, err := contextutils.GetAccountID(ctx)
+	if err != nil {
+		return []*model.Agent{}, err
+	}
+
 	var agents []*model.Agent
 
-	query := r.db.WithContext(ctx).Where("folder_id = ?", folderId)
+	query := r.db.WithContext(ctx).Where("folder_id = ? AND account_id = ?", folderId, accountID)
 
 	if err := query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&agents).Error; err != nil {
 		return []*model.Agent{}, err

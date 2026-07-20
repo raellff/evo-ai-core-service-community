@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -68,6 +69,28 @@ func (m *evoAuthMiddleware) GetEvoAuthMiddleware() gin.HandlerFunc {
 		ctx = context.WithValue(ctx, "user", tokenDataResponse.User)
 		ctx = context.WithValue(ctx, "role", tokenDataResponse.User.Role)
 		ctx = context.WithValue(ctx, "type", tokenDataResponse.User.Type)
+
+		// Tenant scope: a user belongs to exactly one Account (see
+		// specs/multi-account-tenancy), so the first entry is the one.
+		// Deliberately omitted (not zero-valued) when absent so
+		// contextutils.GetAccountID fails closed for tenant-scoped
+		// repositories instead of resolving to a fake/empty account.
+		if len(tokenDataResponse.Accounts) > 0 {
+			account := tokenDataResponse.Accounts[0]
+			ctx = context.WithValue(ctx, "account_id", account.ID)
+
+			// Per-Account feature overrides (see specs/account-feature-toggles).
+			// Parsed once here - the same place account_id is extracted -
+			// instead of at every call site; a malformed/absent payload just
+			// leaves accountFeatures nil, and contextutils.IsFeatureEnabled
+			// falls back to its caller-supplied default in that case.
+			if len(account.Features) > 0 {
+				var accountFeatures map[string]bool
+				if err := json.Unmarshal(account.Features, &accountFeatures); err == nil {
+					ctx = context.WithValue(ctx, "account_features", accountFeatures)
+				}
+			}
+		}
 
 		// Add api_access_token for Evolution API calls
 		// For now, we'll use the Bearer token as api_access_token

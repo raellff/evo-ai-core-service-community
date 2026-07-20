@@ -1,0 +1,5 @@
+-- Irreversible by design (mirrors evo-auth-service-community and
+-- evo-ai-crm-community's own "Account #1" backfill migrations, which raise
+-- ActiveRecord::IrreversibleMigration in `down`): once rows have been
+-- backfilled there is no way to distinguish "was NULL before this
+-- migration" from "was legitimately set to Account #1 afterwards". No-op.

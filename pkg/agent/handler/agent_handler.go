@@ -58,6 +58,7 @@ func (h *agentHandler) RegisterRoutesMiddleware(router gin.IRouter) {
 	permissionMiddleware := middleware.GetGlobalPermissionMiddleware()
 
 	agents := router.Group("/agents")
+	agents.Use(middleware.RequireFeature("ai_agents", true))
 	{
 		agentAccessMiddleware := middleware.NewAgentAccessMiddleware(h.agentService).GetAgentAccessMiddleware()
 
@@ -111,6 +112,7 @@ func (h *agentHandler) RegisterRoutesMiddleware(router gin.IRouter) {
 	}
 
 	folders := router.Group("/agents/folders")
+	folders.Use(middleware.RequireFeature("ai_agents", true))
 	{
 		folders.GET("/:id/agents",
 			permissionMiddleware.RequirePermission("ai_agents", "read"),
