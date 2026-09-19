@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"evo-ai-core-service/internal/utils/stringutils"
+	"evo-ai-core-service/pkg/evoextensions/tenantfield"
 	"fmt"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 )
 
 type Agent struct {
+	tenantfield.TenantField
+
 	ID               uuid.UUID  `json:"-" gorm:"<-:create;type:uuid;primary_key;default:uuid_generate_v4()"`
 	AccountID        *uuid.UUID `json:"-" gorm:"type:uuid;index"` // Tenant scope - stamped from the authenticated request, never client-supplied
 	Name             string     `json:"name" gorm:"not null; type:varchar(255)"`

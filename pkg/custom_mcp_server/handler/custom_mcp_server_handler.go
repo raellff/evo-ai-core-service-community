@@ -7,7 +7,10 @@ import (
 	"evo-ai-core-service/internal/utils/stringutils"
 	"evo-ai-core-service/pkg/custom_mcp_server/model"
 	"evo-ai-core-service/pkg/custom_mcp_server/service"
+	"evo-ai-core-service/pkg/evoextensions/secretmerge"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +26,7 @@ type CustomMcpServerHandler interface {
 	Update(c *gin.Context)
 	Delete(c *gin.Context)
 	Test(c *gin.Context)
+	TestConnection(c *gin.Context)
 }
 
 // customMcpServerHandler implements the CustomMcpServerHandler interface.
@@ -77,6 +81,12 @@ func (h *customMcpServerHandler) RegisterRoutesMiddleware(router gin.IRouter) {
 		customMcpServers.GET("/:id/test",
 			permissionMiddleware.RequirePermission("ai_custom_mcp_servers", "read"),
 			h.Test)
+		// EVO-1739: stateless test-before-save (validates url/headers typed in the wizard).
+		// `create`, not `read`: it fires an outbound request from the processor to a
+		// caller-supplied url and reports the outcome. `read` must not grant that.
+		customMcpServers.POST("/test-connection",
+			permissionMiddleware.RequirePermission("ai_custom_mcp_servers", "create"),
+			h.TestConnection)
 	}
 }
 
@@ -89,13 +99,14 @@ func (h *customMcpServerHandler) Create(c *gin.Context) {
 	}
 
 	customMcpServer := model.CustomMcpServer{
-		Name:        req.Name,
-		Description: req.Description,
-		URL:         req.URL,
-		Headers:     stringutils.StringMapToJSON(req.Headers),
-		Timeout:     req.Timeout,
-		RetryCount:  req.RetryCount,
-		Tags:        req.Tags,
+		Name:           req.Name,
+		Description:    req.Description,
+		URL:            req.URL,
+		Headers:        stringutils.StringMapToJSON(req.Headers),
+		CredentialRefs: stringutils.StringMapToJSON(req.CredentialRefs),
+		Timeout:        req.Timeout,
+		RetryCount:     req.RetryCount,
+		Tags:           req.Tags,
 	}
 
 	createdCustomMcpServer, err := h.customMcpServerService.Create(c.Request.Context(), customMcpServer)
@@ -129,6 +140,57 @@ func (h *customMcpServerHandler) GetByID(c *gin.Context) {
 }
 
 // List handles the list custom mcp servers request.
+var customMcpServerFilterKeyPattern = regexp.MustCompile(`^filters\[(\d+)\]\[(\w+)\]$`)
+
+// parseCustomMcpServerFilters reads the advanced-filter payload the Custom MCP
+// Servers list screen sends in bracket query params
+// (filters[0][attribute_key]=name&...), ordered by index. Unknown attribute keys
+// are dropped later by the whitelist.
+func parseCustomMcpServerFilters(c *gin.Context) []model.CustomMcpServerListFilter {
+	byIndex := map[int]*model.CustomMcpServerListFilter{}
+
+	for key, values := range c.Request.URL.Query() {
+		matches := customMcpServerFilterKeyPattern.FindStringSubmatch(key)
+		if matches == nil || len(values) == 0 {
+			continue
+		}
+
+		index, err := strconv.Atoi(matches[1])
+		if err != nil {
+			continue
+		}
+
+		filter, ok := byIndex[index]
+		if !ok {
+			filter = &model.CustomMcpServerListFilter{}
+			byIndex[index] = filter
+		}
+
+		switch matches[2] {
+		case "attribute_key":
+			filter.AttributeKey = values[0]
+		case "filter_operator":
+			filter.FilterOperator = values[0]
+		case "query_operator":
+			filter.QueryOperator = values[0]
+		case "values":
+			filter.Values = []string{values[0]}
+		}
+	}
+
+	indices := make([]int, 0, len(byIndex))
+	for index := range byIndex {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+
+	filters := make([]model.CustomMcpServerListFilter, 0, len(indices))
+	for _, index := range indices {
+		filters = append(filters, *byIndex[index])
+	}
+	return filters
+}
+
 func (h *customMcpServerHandler) List(c *gin.Context) {
 	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if err != nil {
@@ -171,6 +233,7 @@ func (h *customMcpServerHandler) List(c *gin.Context) {
 	req.PageSize = pageSize
 	req.Search = search
 	req.Tags = tags
+	req.Filters = parseCustomMcpServerFilters(c)
 
 	listCustomMcpServer, err := h.customMcpServerService.List(c.Request.Context(), req)
 
@@ -198,14 +261,22 @@ func (h *customMcpServerHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// Same reason as the tool update: the response stopped returning header
+	// values, so a save that omits them must not erase the stored secret.
+	mergedHeaders := req.Headers
+	if stored, err := h.customMcpServerService.GetByID(c.Request.Context(), id); err == nil && stored != nil {
+		mergedHeaders = secretmerge.KeepMissing(req.Headers, stringutils.JSONToStringMap(stored.Headers))
+	}
+
 	customMcpServer := &model.CustomMcpServer{
-		Name:        req.Name,
-		Description: req.Description,
-		URL:         req.URL,
-		Headers:     stringutils.StringMapToJSON(req.Headers),
-		Timeout:     req.Timeout,
-		RetryCount:  req.RetryCount,
-		Tags:        req.Tags,
+		Name:           req.Name,
+		Description:    req.Description,
+		URL:            req.URL,
+		Headers:        stringutils.StringMapToJSON(mergedHeaders),
+		CredentialRefs: stringutils.StringMapToJSON(req.CredentialRefs),
+		Timeout:        req.Timeout,
+		RetryCount:     req.RetryCount,
+		Tags:           req.Tags,
 	}
 
 	updatedCustomMcpServer, err := h.customMcpServerService.Update(c.Request.Context(), customMcpServer, id)
@@ -254,4 +325,25 @@ func (h *customMcpServerHandler) Test(c *gin.Context) {
 	}
 
 	response.SuccessResponse(c, customMcpServer, "Custom MCP server test completed successfully", http.StatusOK)
+}
+
+// TestConnection tests an UNSAVED MCP server's url/headers (test-before-save). EVO-1739.
+func (h *customMcpServerHandler) TestConnection(c *gin.Context) {
+	var req struct {
+		URL     string            `json:"url" binding:"required"`
+		Headers map[string]string `json:"headers"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.ValidationErrorResponse(c, err)
+		return
+	}
+
+	testResult, err := h.customMcpServerService.TestConnection(c.Request.Context(), req.URL, req.Headers)
+	if err != nil {
+		code, message, httpCode := errors.HandleError(err)
+		response.ErrorResponse(c, code, message, nil, httpCode)
+		return
+	}
+
+	response.SuccessResponse(c, gin.H{"test_result": testResult}, "Custom MCP server test completed successfully", http.StatusOK)
 }

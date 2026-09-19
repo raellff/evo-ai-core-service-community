@@ -5,16 +5,18 @@ import (
 	"errors"
 	"evo-ai-core-service/internal/config"
 	"evo-ai-core-service/internal/httpclient"
+	apierrors "evo-ai-core-service/internal/httpclient/errors"
 	errorsPostgres "evo-ai-core-service/internal/infra/postgres"
 	"evo-ai-core-service/internal/utils/contextutils"
 	"evo-ai-core-service/internal/utils/stringutils"
 
 	model "evo-ai-core-service/pkg/custom_mcp_server/model"
 	repository "evo-ai-core-service/pkg/custom_mcp_server/repository"
+	"evo-ai-core-service/pkg/evoextensions/runtimecontext"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -27,6 +29,9 @@ type CustomMcpServerService interface {
 	Delete(ctx context.Context, id uuid.UUID) (bool, error)
 	GetByAgentConfig(ctx context.Context, serverIDs []uuid.UUID) ([]*model.CustomMcpServer, error)
 	Test(ctx context.Context, id uuid.UUID) (*model.CustomMcpServerTestResponse, error)
+	// EVO-1739: stateless test of an UNSAVED server's url/headers, so the wizard can
+	// "test before save". Reuses the same processor MCP handshake as Test.
+	TestConnection(ctx context.Context, url string, headers map[string]string) (*model.TestResult, error)
 }
 
 type customMcpServerService struct {
@@ -153,12 +158,25 @@ func (s *customMcpServerService) discoverTools(ctx context.Context, request mode
 		"Authorization": fmt.Sprintf("Bearer %s", token),
 	}
 
+	// Propagate the active tenant to the processor so it can authorize the
+	// call. runtimecontext returns "" in community builds, so the header is
+	// attached only when a scope bound a real tenant id. The header name is
+	// spelled out rather than imported, to keep this package free of any
+	// enterprise dependency.
+	if tenantID := runtimecontext.IDFromContext(ctx); tenantID != "" {
+		headers["X-Evo-Tenant-Id"] = tenantID
+	}
+
 	tools, err := httpclient.DoPostJSON[model.CustomMcpServerToolsResponse](
 		ctx,
 		fmt.Sprintf("%s/api/%s/custom-mcp-servers/discover-tools", s.cfgAIProcessorService.URL, s.cfgAIProcessorService.Version),
+		// The vault references travel instead of the resolved values: the
+		// processor reads the secret itself, so a plaintext credential no
+		// longer crosses the service boundary in a JSON body .
 		map[string]interface{}{
-			"url":     request.URL,
-			"headers": stringutils.JSONToStringMap(request.Headers),
+			"url":             request.URL,
+			"headers":         stringutils.JSONToStringMap(request.Headers),
+			"credential_refs": stringutils.JSONToStringMap(request.CredentialRefs),
 		},
 		headers,
 		http.StatusOK,
@@ -186,36 +204,115 @@ func (s *customMcpServerService) Test(ctx context.Context, id uuid.UUID) (*model
 		return nil, errorsPostgres.MapDBError(err, model.CustomMCPServerErrors)
 	}
 
-	url := customMcpServer.URL
-	if !strings.HasSuffix(url, "/health") {
-		url = strings.TrimRight(url, "/") + "/health"
-	}
-
-	headers := stringutils.JSONToStringMap(customMcpServer.Headers)
-	start := time.Now()
-
-	type HealthResponse struct{}
-	_, err = httpclient.DoGetJSON[HealthResponse](ctx, url, headers, http.StatusOK)
-	elapsed := time.Since(start)
-
-	response := customMcpServer.ToResponse()
-	testResult := &model.TestResult{
-		URLTested: url,
-	}
-
-	testResult.Success = true
-	testResult.StatusCode = http.StatusOK
-	testResult.ResponseTime = elapsed.Seconds()
-	testResult.Message = "Connection successful"
-
+	testResult, err := s.testConnection(ctx, customMcpServer.URL, stringutils.JSONToStringMap(customMcpServer.Headers))
 	if err != nil {
-		testResult.StatusCode = http.StatusInternalServerError
-		testResult.Success = false
-		testResult.Error = err.Error()
+		return nil, err
 	}
 
 	return &model.CustomMcpServerTestResponse{
-		Server:     response,
+		Server:     customMcpServer.ToResponse(),
 		TestResult: testResult,
+	}, nil
+}
+
+// TestConnection runs the MCP handshake against arbitrary url/headers without a saved
+// server — powers the wizard's "test before save" (EVO-1739).
+func (s *customMcpServerService) TestConnection(ctx context.Context, rawURL string, headers map[string]string) (*model.TestResult, error) {
+	if err := validateTestConnectionURL(rawURL); err != nil {
+		return nil, err
+	}
+	return s.testConnection(ctx, rawURL, headers)
+}
+
+// validateTestConnectionURL requires an absolute http/https url with a host, since the
+// caller supplies it and the processor dials it. No private/loopback blocklist: a
+// self-hosted Evolution normally runs its MCP servers on the same private network.
+func validateTestConnectionURL(rawURL string) error {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return apierrors.New(apierrors.ValidationError, "url is required", http.StatusBadRequest)
+	}
+
+	parsed, err := neturl.Parse(trimmed)
+	if err != nil {
+		return apierrors.New(apierrors.ValidationError, "url is not a valid URL", http.StatusBadRequest)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return apierrors.New(apierrors.ValidationError, "url must use the http or https scheme", http.StatusBadRequest)
+	}
+	if parsed.Host == "" {
+		return apierrors.New(apierrors.ValidationError, "url must include a host", http.StatusBadRequest)
+	}
+
+	return nil
+}
+
+// EVO-2139: delegate the MCP connection test to the processor, which owns
+// the real handshake (POST JSON-RPC 2.0 `initialize`) via Google ADK's
+// MCPToolset. The previous implementation did a raw `GET /health` from Go
+// and failed for every compliant MCP server — the route does not exist in
+// the MCP spec. Mirrors the discoverTools delegation pattern above,
+// including X-Evo-Tenant-Id propagation.
+func (s *customMcpServerService) testConnection(ctx context.Context, url string, headers map[string]string) (*model.TestResult, error) {
+	token, err := contextutils.GetToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	reqHeaders := map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": fmt.Sprintf("Bearer %s", token),
+	}
+	if tenantID := runtimecontext.IDFromContext(ctx); tenantID != "" {
+		reqHeaders["X-Evo-Tenant-Id"] = tenantID
+	}
+
+	type processorTestResponse struct {
+		Success      bool    `json:"success"`
+		StatusCode   int     `json:"status_code"`
+		ResponseTime float64 `json:"response_time"`
+		URLTested    string  `json:"url_tested"`
+		Message      string  `json:"message"`
+		Error        string  `json:"error"`
+		ToolsCount   int     `json:"tools_count"`
+	}
+
+	// Processor always returns 200 with the result envelope (success/failure
+	// inside `success`), matching the discover-tools pattern.
+	resp, err := httpclient.DoPostJSON[processorTestResponse](
+		ctx,
+		fmt.Sprintf("%s/api/%s/custom-mcp-servers/test-connection", s.cfgAIProcessorService.URL, s.cfgAIProcessorService.Version),
+		map[string]interface{}{
+			"url":     url,
+			"headers": headers,
+		},
+		reqHeaders,
+		http.StatusOK,
+	)
+	if err != nil {
+		return &model.TestResult{
+			Success:   false,
+			URLTested: url,
+			Error:     err.Error(),
+		}, nil
+	}
+
+	statusCode := resp.StatusCode
+	if statusCode == 0 {
+		if resp.Success {
+			statusCode = http.StatusOK
+		} else {
+			statusCode = http.StatusBadGateway
+		}
+	}
+
+	return &model.TestResult{
+		Success:      resp.Success,
+		StatusCode:   statusCode,
+		ResponseTime: resp.ResponseTime,
+		URLTested:    resp.URLTested,
+		Message:      resp.Message,
+		Error:        resp.Error,
+		ToolsCount:   resp.ToolsCount,
 	}, nil
 }

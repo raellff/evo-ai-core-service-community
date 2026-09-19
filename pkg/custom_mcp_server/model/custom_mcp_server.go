@@ -2,6 +2,8 @@ package model
 
 import (
 	"evo-ai-core-service/internal/utils/stringutils"
+	"evo-ai-core-service/pkg/evoextensions/secretmerge"
+	"evo-ai-core-service/pkg/evoextensions/tenantfield"
 	"time"
 
 	"github.com/google/uuid"
@@ -9,17 +11,21 @@ import (
 )
 
 type CustomMcpServer struct {
-	ID          uuid.UUID      `json:"-" gorm:"<-:create;type:uuid;primary_key;default:uuid_generate_v4()"`
-	Name        string         `json:"-" gorm:"not null; type:varchar(255)"`
-	Description string         `json:"-" gorm:"type:text"`
-	URL         string         `json:"-" gorm:"not null; type:varchar(1024)"`
-	Headers     string         `json:"-" gorm:"not null; type:json"`
-	Timeout     int            `json:"-" gorm:"not null; type:integer"`
-	RetryCount  int            `json:"-" gorm:"not null; type:integer"`
-	Tags        pq.StringArray `json:"-" gorm:"not null; type:varchar(255)[]" default:"{}"`
-	Tools       string         `json:"-" gorm:"not null; type:json"`
-	CreatedAt   time.Time      `json:"-" gorm:"autoCreateTime;not null" default:"now()"`
-	UpdatedAt   time.Time      `json:"-" gorm:"autoUpdateTime;not null" default:"now()"`
+	tenantfield.TenantField
+
+	ID          uuid.UUID `json:"-" gorm:"<-:create;type:uuid;primary_key;default:uuid_generate_v4()"`
+	Name        string    `json:"-" gorm:"not null; type:varchar(255)"`
+	Description string    `json:"-" gorm:"type:text"`
+	URL         string    `json:"-" gorm:"not null; type:varchar(1024)"`
+	Headers     string    `json:"-" gorm:"not null; type:json"`
+	// Vault references: header name -> credential id .
+	CredentialRefs string         `json:"-" gorm:"not null; type:jsonb;default:'{}'"`
+	Timeout        int            `json:"-" gorm:"not null; type:integer"`
+	RetryCount     int            `json:"-" gorm:"not null; type:integer"`
+	Tags           pq.StringArray `json:"-" gorm:"not null; type:varchar(255)[]" default:"{}"`
+	Tools          string         `json:"-" gorm:"not null; type:json"`
+	CreatedAt      time.Time      `json:"-" gorm:"autoCreateTime;not null" default:"now()"`
+	UpdatedAt      time.Time      `json:"-" gorm:"autoUpdateTime;not null" default:"now()"`
 }
 
 func (CustomMcpServer) TableName() string {
@@ -27,14 +33,15 @@ func (CustomMcpServer) TableName() string {
 }
 
 type CustomMcpServerBase struct {
-	Name        string                   `json:"name" binding:"required"`
-	Description string                   `json:"description"`
-	URL         string                   `json:"url" binding:"required"`
-	Headers     map[string]string        `json:"headers" binding:"required"`
-	Timeout     int                      `json:"timeout" binding:"min=0"`
-	RetryCount  int                      `json:"retry_count" binding:"min=0"`
-	Tags        []string                 `json:"tags" validate:"dive"`
-	Tools       []map[string]interface{} `json:"-"`
+	Name           string                   `json:"name" binding:"required"`
+	Description    string                   `json:"description"`
+	URL            string                   `json:"url" binding:"required"`
+	Headers        map[string]string        `json:"headers" binding:"required"`
+	CredentialRefs map[string]string        `json:"credential_refs"`
+	Timeout        int                      `json:"timeout" binding:"min=0"`
+	RetryCount     int                      `json:"retry_count" binding:"min=0"`
+	Tags           []string                 `json:"tags" validate:"dive"`
+	Tools          []map[string]interface{} `json:"-"`
 }
 
 type CustomMcpServerRequest struct {
@@ -46,17 +53,18 @@ type CustomMcpServerUpdateRequest struct {
 }
 
 type CustomMcpServerResponse struct {
-	ID          uuid.UUID                `json:"id"`
-	Name        string                   `json:"name"`
-	Description string                   `json:"description"`
-	URL         string                   `json:"url"`
-	Headers     map[string]string        `json:"headers"`
-	Timeout     int                      `json:"timeout"`
-	RetryCount  int                      `json:"retry_count"`
-	Tags        []string                 `json:"tags"`
-	Tools       []map[string]interface{} `json:"tools"`
-	CreatedAt   time.Time                `json:"created_at"`
-	UpdatedAt   time.Time                `json:"updated_at"`
+	ID             uuid.UUID                `json:"id"`
+	Name           string                   `json:"name"`
+	Description    string                   `json:"description"`
+	URL            string                   `json:"url"`
+	Headers        map[string]string        `json:"headers"`
+	CredentialRefs map[string]string        `json:"credential_refs"`
+	Timeout        int                      `json:"timeout"`
+	RetryCount     int                      `json:"retry_count"`
+	Tags           []string                 `json:"tags"`
+	Tools          []map[string]interface{} `json:"tools"`
+	CreatedAt      time.Time                `json:"created_at"`
+	UpdatedAt      time.Time                `json:"updated_at"`
 }
 
 type TestResult struct {
@@ -66,6 +74,13 @@ type TestResult struct {
 	URLTested    string  `json:"url_tested"`
 	Message      string  `json:"message,omitempty"`
 	Error        string  `json:"error,omitempty"`
+	// EVO-2139: number of tools discovered in this test's MCP handshake.
+	// The UI shows this in the toast instead of `server.tools.length` (which
+	// reflects the DB, possibly 0 if the original Create failed to populate).
+	// No `omitempty`: a successful test that finds 0 tools is a legitimate 0
+	// that must still reach the UI, otherwise the client falls back to the
+	// DB-stale length instead of the live handshake count.
+	ToolsCount int `json:"tools_count"`
 }
 
 type CustomMcpServerTestResponse struct {
@@ -74,10 +89,20 @@ type CustomMcpServerTestResponse struct {
 }
 
 type CustomMcpServerListRequest struct {
-	Page     int    `json:"-" binding:"required"`
-	PageSize int    `json:"-" binding:"required"`
-	Search   string `json:"-" binding:"required"`
-	Tags     string `json:"-"`
+	Page     int                         `json:"-" binding:"required"`
+	PageSize int                         `json:"-" binding:"required"`
+	Search   string                      `json:"-" binding:"required"`
+	Tags     string                      `json:"-"`
+	Filters  []CustomMcpServerListFilter `json:"-"`
+}
+
+// CustomMcpServerListFilter is one advanced-filter clause from the Custom MCP
+// Servers list screen (filters[i][attribute_key|filter_operator|values|query_operator]).
+type CustomMcpServerListFilter struct {
+	AttributeKey   string
+	FilterOperator string
+	QueryOperator  string
+	Values         []string
 }
 
 type CustomMcpServerToolsResponse struct {
@@ -95,17 +120,27 @@ type CustomMcpServerListResponse struct {
 }
 
 func (u *CustomMcpServer) ToResponse() *CustomMcpServerResponse {
+	// EVO-2139: normaliza Tools para [] em vez de nil para que clients HTTP
+	// nunca recebam `"tools": null`. Um server com Tools ainda não descobertas
+	// (ex.: falha intermitente no Create) marshalava como null e crashava
+	// consumidores que acessavam `.length` diretamente.
+	tools := stringutils.JSONToInterfaceMapSlice(u.Tools)
+	if tools == nil {
+		tools = []map[string]interface{}{}
+	}
 	return &CustomMcpServerResponse{
 		ID:          u.ID,
 		Name:        u.Name,
 		Description: u.Description,
 		URL:         u.URL,
-		Headers:     stringutils.JSONToStringMap(u.Headers),
-		Timeout:     u.Timeout,
-		RetryCount:  u.RetryCount,
-		Tags:        u.Tags,
-		Tools:       stringutils.JSONToInterfaceMapSlice(u.Tools),
-		CreatedAt:   u.CreatedAt,
-		UpdatedAt:   u.UpdatedAt,
+		// Header VALUES are redacted, names survive .
+		Headers:        secretmerge.RedactValues(stringutils.JSONToStringMap(u.Headers)),
+		CredentialRefs: stringutils.JSONToStringMap(u.CredentialRefs),
+		Timeout:        u.Timeout,
+		RetryCount:     u.RetryCount,
+		Tags:           u.Tags,
+		Tools:          tools,
+		CreatedAt:      u.CreatedAt,
+		UpdatedAt:      u.UpdatedAt,
 	}
 }

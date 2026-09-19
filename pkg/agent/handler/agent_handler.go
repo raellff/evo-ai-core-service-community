@@ -9,11 +9,14 @@ import (
 	"evo-ai-core-service/internal/utils/stringutils"
 	"evo-ai-core-service/pkg/agent/model"
 	"evo-ai-core-service/pkg/agent/service"
+	"evo-ai-core-service/pkg/evoextensions/agentquota"
 	folderShareService "evo-ai-core-service/pkg/folder_share/service"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -35,6 +38,13 @@ type AgentHandler interface {
 	GetShareAgent(c *gin.Context)
 	AssignFolder(c *gin.Context)
 }
+
+// checkAgentQuota is the seam every agent-creating route asks before writing.
+//
+// A package variable so a test can observe THAT it was asked and WITH WHAT: the
+// defect it exists for was a missing call site, which no test of the quota
+// decision itself can catch.
+var checkAgentQuota = agentquota.Check
 
 // agentHandler implements the AgentHandler interface
 type agentHandler struct {
@@ -128,6 +138,14 @@ func (h *agentHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// Enterprise enforces the tenant's plan `agents` limit here; community's Check
+	// is a no-op. NOT the only create path — ImportAgents gates separately.
+	if err := checkAgentQuota(c.Request.Context(), 1); err != nil {
+		code, message, httpCode := errors.HandleError(err)
+		response.ErrorResponse(c, code, message, nil, httpCode)
+		return
+	}
+
 	agent := model.Agent{
 		Name:        req.Name,
 		Description: req.Description,
@@ -173,6 +191,56 @@ func (h *agentHandler) GetByID(c *gin.Context) {
 }
 
 // List handles the list agents request
+var agentFilterKeyPattern = regexp.MustCompile(`^filters\[(\d+)\]\[(\w+)\]$`)
+
+// parseAgentFilters reads the advanced-filter payload the Agents list screen
+// sends in bracket query params (filters[0][attribute_key]=name&...), ordered
+// by index. Unknown attribute keys are dropped later by the repository whitelist.
+func parseAgentFilters(c *gin.Context) []model.AgentListFilter {
+	byIndex := map[int]*model.AgentListFilter{}
+
+	for key, values := range c.Request.URL.Query() {
+		matches := agentFilterKeyPattern.FindStringSubmatch(key)
+		if matches == nil || len(values) == 0 {
+			continue
+		}
+
+		index, err := strconv.Atoi(matches[1])
+		if err != nil {
+			continue
+		}
+
+		filter, ok := byIndex[index]
+		if !ok {
+			filter = &model.AgentListFilter{}
+			byIndex[index] = filter
+		}
+
+		switch matches[2] {
+		case "attribute_key":
+			filter.AttributeKey = values[0]
+		case "filter_operator":
+			filter.FilterOperator = values[0]
+		case "query_operator":
+			filter.QueryOperator = values[0]
+		case "values":
+			filter.Values = []string{values[0]}
+		}
+	}
+
+	indices := make([]int, 0, len(byIndex))
+	for index := range byIndex {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+
+	filters := make([]model.AgentListFilter, 0, len(indices))
+	for _, index := range indices {
+		filters = append(filters, *byIndex[index])
+	}
+	return filters
+}
+
 func (h *agentHandler) List(c *gin.Context) {
 	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if err != nil {
@@ -207,7 +275,10 @@ func (h *agentHandler) List(c *gin.Context) {
 		pageSize = limitVal
 	}
 
-	listAgents, err := h.agentService.List(c.Request.Context(), page, pageSize)
+	filters := parseAgentFilters(c)
+	search := c.Query("search")
+
+	listAgents, err := h.agentService.List(c.Request.Context(), page, pageSize, filters, search)
 
 	if err != nil {
 		code, message, httpCode := errors.HandleError(err)
@@ -354,6 +425,19 @@ func (h *agentHandler) ImportAgents(c *gin.Context) {
 	if err := json.Unmarshal(fileContent, &agentsData); err != nil {
 		response.ErrorResponse(c, errors.BadRequest, err.Error(), nil, http.StatusBadRequest)
 		return
+	}
+
+	// Gate the bulk path with the size of THIS request: the service creates one row
+	// per item with no size cap. Checked right after the unmarshal, before any row
+	// is written — the count is only knowable here, and rejecting later would leave
+	// a partial import to undo. An empty payload creates nothing, so it is not
+	// charged against the quota.
+	if len(agentsData) > 0 {
+		if err := checkAgentQuota(c.Request.Context(), len(agentsData)); err != nil {
+			code, message, httpCode := errors.HandleError(err)
+			response.ErrorResponse(c, code, message, nil, httpCode)
+			return
+		}
 	}
 
 	AgentImportRequest := model.AgentImportRequest{
