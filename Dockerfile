@@ -6,8 +6,8 @@ WORKDIR /app
 # Instala dependências do sistema
 RUN apk add --no-cache git
 
-# Instala golang-migrate
-RUN go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+# Instala golang-migrate (versão fixada: @latest exige Go >= 1.25, incompatível com esta imagem)
+RUN go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.18.3
 
 # Copia os arquivos de dependência (inclui o modfile community)
 COPY go.mod go.sum go.community.mod go.community.sum ./
